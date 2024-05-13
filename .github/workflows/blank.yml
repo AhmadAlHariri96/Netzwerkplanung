@@ -1,0 +1,310 @@
+########################################################################################
+#                   Pandapipes_netz_Betrachtet
+#                   Mutli_Net Optimierung
+########################################################################################
+import matplotlib.pyplot as plt
+import pandas as pd
+import pandapower as ppower
+import pandapipes as ppipes
+from pandapipes.multinet.create_multinet import create_empty_multinet, add_net_to_multinet
+from pandapipes.multinet.control.controller.multinet_control import coupled_p2g_const_control,coupled_g2p_const_control
+
+from oemof.solph import components as cmp
+from oemof.tools import economics
+import numpy as np
+
+from oemof import solph
+
+
+def main():
+    
+    #Leistung Grid/Gen elektrisch in MW
+    max_p_mw_grid = 1
+    max_p_mw_gen = 1
+
+
+    demand_el = [
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        0,
+        0,
+        1,
+        1,
+        1,
+        0,
+        0,
+        1,
+        1,
+        1,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        0,
+        0,
+    ]
+
+    price_gas = 0.04
+   
+    epc_wind = economics.annuity(capex=1000, n=20, wacc=0.05)
+    epc_pv = economics.annuity(capex=1000, n=20, wacc=0.05)
+    epc_storage = economics.annuity(capex=1000, n=20, wacc=0.05)
+    
+    #create empty nets
+    net_power = ppower.create_empty_network()
+    net_gas = ppipes.create_empty_network(fluid="hydrogen")
+
+    # create an energy system
+    idx = solph.create_time_index(2017, number=len(demand_el))
+    es = solph.EnergySystem(timeindex=idx, infer_last_interval=False)
+    #create buses
+    bus1 = ppower.create_bus(net_power, vn_kv=0.8, name="Bus 1")
+
+    
+    load1 = ppower.create_load(net_power, bus=bus1,nominal_value=100, p_mw=0.03, min_p_mw=0, max_p_mw=0.2, min_q_mvar=0, max_q_mvar=0.3, controllable=False,  name="Load 1")
+
+    gen1 = ppower.create_sgen(net_power, bus=bus1,nominal_value=10, variable_costs=10,p_mw=0.5, min_p_mw=0.2, max_p_mw=1, controllable=True,  name="Gen1")
+
+    storage1=ppower.create_storage(net_power, bus=bus1, p_mw=0.5, max_e_mwh=.2, soc_percent=0., q_mvar=0., controllable=True,  name="St1")
+
+
+    junction1 = ppipes.create_junction(net_gas, pn_bar=1.05, tfluid_k=293.15, name="Junction 1", geodata=(2, 0))
+    
+    source = ppipes.create_source(net_gas, junction=junction1,nominal_value=10, mdot_kg_per_s=0.001)
+
+
+    # create multinet and add networks:
+    multinet = create_empty_multinet("PtG_multinet")
+    add_net_to_multinet(multinet, net_power, 'net_power')
+    add_net_to_multinet(multinet, net_gas, 'net_gas')
+    
+    # create elements corresponding to conversion units:
+    p2g_el = ppower.create_load(net_power, bus=bus1, p_mw=0.5,nominal_value=10, name="power to gas consumption")
+    p2g_gas = ppipes.create_source(net_gas, junction=junction1, nominal_value=10,mdot_kg_per_s=0, name="power to gas feed in")
+
+    #Controller for Multi-energy flow and time series
+    coupled_p2g_const_control(multinet, p2g_el, p2g_gas,
+                              name_power_net="net_power", name_gas_net="net_gas",
+                              profile_name='power to gas consumption', data_source=idx,
+                              p2g_efficiency=0.7)
+
+
+
+    oemof_buses = {}
+    oemof_sinks = {}
+    oemof_sources = {}
+    oemof_storages = []
+
+    # Konvertierung der Pandapower Busse zu Oemof Bussen
+    for bus in net_power.bus.itertuples():
+        power_bus_label = f"Power_Bus_{bus.Index}"
+        if power_bus_label not in oemof_buses:
+            power_bus = solph.Bus(label=power_bus_label)
+            es.add(power_bus)
+            oemof_buses[power_bus_label] = power_bus
+            # Hinzufügen einer Überschusskomponente für diesen Bus
+            # Hinzufügen einer Überschuss-Senke für diesen Bus, um überschüssige Energie aufzunehmen und zu verhindern,
+            #dass das Modell durch Überproduktion unlösbar wird. 
+            #Dies ermöglicht eine flexiblere Handhabung von Energieüberschüssen im System.
+            excess_label = f"Excess_{power_bus_label}"
+            excess_sink = solph.components.Sink(label=excess_label, inputs={power_bus: solph.Flow()})
+            es.add(excess_sink)
+            # Hinzufügen einer Mangel-Quelle für diesen Bus
+            # Hinzufügen einer Mangel-Quelle für diesen Bus,
+            #um mögliche Energiemängel durch das Bereitstellen von Energie zu hohen Kosten auszugleichen.
+            #Dies dient als letzte Option zur Sicherstellung der Versorgung, wenn das vorhandene Angebot die Nachfrage nicht decken kann.
+            shortage_label = f"Shortage_{power_bus_label}"
+            shortage_source = solph.components.Source(label=shortage_label, outputs={power_bus: solph.Flow(variable_costs=1000)})
+            es.add(shortage_source)
+            
+       # Konvertierung der Pandapipes Junctions zu Oemof Bussen
+    for junction in net_gas.junction.itertuples():
+        gas_bus_label = f"Gas_Junction_{junction.Index}"
+        if gas_bus_label not in oemof_buses:
+            gas_bus = solph.Bus(label=gas_bus_label)
+            es.add(gas_bus)
+            oemof_buses[gas_bus_label] = gas_bus
+   
+    # power bus and components
+    #bel = solph.Bus(label="bel")
+
+    if hasattr(net_power, 'load') and not net_power.load.empty:
+        for pandapower_load in net_power.load.itertuples(index=False):
+            p_mw = pandapower_load.p_mw
+            # Umrechnung von MW in Watt
+            #P_W_oemof = p_mw * 1e6
+            nominal_value=pandapower_load.nominal_value
+            oemof_sink = solph.components.Sink(label=pandapower_load.name,
+                                    inputs={oemof_buses[f"Power_Bus_{pandapower_load.bus}"]: 
+                                            solph.Flow(fix=demand_el, nominal_value=nominal_value)})
+            es.add(oemof_sink)
+            oemof_sinks[pandapower_load.name] = oemof_sink
+
+    # Konvertierung von Pandapower-Sources in Oemof-Sources
+    if hasattr(net_power, 'sgen') and not net_power.sgen.empty:
+        for pandapower_source in net_power.sgen.itertuples(index=False):
+            source_label = pandapower_source.name  # Name der Quelle
+            bus_index = pandapower_source.bus     # Bus-Index
+            p_mw = pandapower_source.p_mw         # Leistung in MW
+            variable_costs=pandapower_source.variable_costs
+            min_p_mw_oemof=pandapower_source.min_p_mw * 1e6
+            max_p_mw_oemof=pandapower_source.max_p_mw* 1e6
+            nominal_value=pandapower_source.nominal_value
+
+            oemof_source = solph.components.Source(label=source_label,
+                                        outputs={oemof_buses[f"Power_Bus_{bus_index}"]: 
+                                                 solph.Flow(nominal_value=nominal_value,
+                                                            variable_costs=variable_costs,
+                                                            nonconvex=solph.NonConvex(startup_costs=500, shutdown_costs=500),
+                                                            )})
+            es.add(oemof_source)
+            oemof_sources[source_label] = oemof_source
+
+    # Integration der pandapower Storage in oemof.solph
+    if hasattr(net_power, 'storage') and not net_power.storage.empty:
+        for pandapower_storage in net_power.storage.itertuples(index=False):
+            connected_bus = oemof_buses[f"Power_Bus_{pandapower_storage.bus}"]
+            #storage_capacity = pandapower_storage.max_e_mwh  # Maximale Energiekapazität in MWh
+            #charge_power = pandapower_storage.max_p_mw  # Maximale Ladeleistung in MW
+            #discharge_power = pandapower_storage.max_p_mw  # Maximale Entladeleistung in MW
+            #charge_efficiency = pandapower_storage.efficiency_percent / 100  # Ladeeffizienz
+            #discharge_efficiency = pandapower_storage.efficiency_percent / 100  # Entladeeffizienz
+            #loss_rate = pandapower_storage.self_discharge_percent / 100  # Selbstentladungsrate pro Stunde
+
+            oemof_storage = solph.components.GenericStorage(
+                label=pandapower_storage.name,
+                inputs={connected_bus: solph.Flow(variable_costs=0.0)}, 
+                outputs={connected_bus: solph.Flow()},  # Annahme von Null variablen Kosten fürs Entladen
+                nominal_storage_capacity=solph.Investment(ep_costs=epc_storage),
+                loss_rate=0.00,
+                initial_storage_level=0,
+                invest_relation_input_capacity=1 / 6,
+                invest_relation_output_capacity=1 / 6,
+                inflow_conversion_factor=1,
+                outflow_conversion_factor=0.8,
+                #initial_storage_level=pandapower_storage.soc_percent / 100  # Anfängliches Speicherniveau als Anteil
+            )
+
+            # Hinzufügen des Storage-Objekts zur Liste und zum Energiesystem
+            es.add(oemof_storage)
+            oemof_storages.append(oemof_storage)
+
+    # Konvertierung von Pandapipes-Sources in Oemof-Sources
+    if hasattr(net_gas, 'source') and not net_gas.source.empty:
+        for pandapipes_source in net_gas.source.itertuples(index=False):
+            source_label = pandapipes_source[0]  # Name der Quelle
+            junction_index = pandapipes_source[1]  # Junction-Index
+            mdot_kg_per_s = pandapipes_source[2]  # Massenstrom in kg/s
+        
+            #P_W_oemof = mdot_kg_per_s * c_p * temperature_difference_K  # Umrechnung in Energiestrom in Watt
+        
+            oemof_source = solph.components.Source(label=source_label,
+                                        outputs={oemof_buses[f"Gas_Junction_{junction_index}"]: 
+                                                 solph.Flow(variable_costs=price_gas)})
+            es.add(oemof_source)
+            oemof_sources[source_label] = oemof_source
+
+
+    # Konvertierung von Pandapipes-Sinks in Oemof-Sinks
+    if hasattr(net_gas, 'sink') and not net_gas.sink.empty:
+        for pandapipes_sink in net_gas.sink.itertuples(index=False):
+            mdot_kg_per_s = pandapipes_sink.mdot_kg_per_s
+            #P_W_oemof = mdot_kg_per_s * c_p * temperature_difference_K  # Umrechnung in Energiestrom in Watt
+        
+            oemof_sink = cmp.Sink(label=pandapipes_sink.name,
+                                    inputs={oemof_buses[f"Gas_Junction_{pandapipes_sink.junction}"]: 
+                                            solph.Flow(fix=100, nominal_value=100)})
+            es.add(oemof_sink)
+            oemof_sinks[pandapipes_sink.name] = oemof_sink
+
+
+
+
+
+    oemof_converter = solph.components.Converter(
+    label="P2G_Converter",
+    inputs={oemof_buses["Gas_Junction_0"]: solph.Flow()},
+    outputs={oemof_buses["Power_Bus_0"]: solph.Flow(nominal_value=10, variable_costs=0)},
+    conversion_factors={oemof_buses["Power_Bus_0"]: 0.7}
+    )
+    es.add(oemof_converter)
+
+    
+    # pp1 and pp2 are competing to serve overall 12 units load at lowest cost
+    # summed costs for pp1 = 12 * 10 * 10.25 = 1230
+    # summed costs for pp2 = 4*5 + 4*5 + 12 * 10 * 10 = 1240
+    # => pp1 serves the load despite of higher variable costs since
+    #    the start and shutdown costs of pp2 change its marginal costs
+    #pp1 = solph.components.Source(
+        #label="power_plant1",
+        #outputs={bel: solph.Flow(nominal_value=10, variable_costs=10.25)},
+    #)
+
+    # shutdown costs only work in combination with a minimum load
+    # since otherwise the status variable is "allowed" to be active i.e.
+    # it permanently has a value of one which does not allow to set the shutdown
+    # variable which is set to one if the status variable changes from one to zero
+    #pp2 = solph.components.Source(
+     #   label="power_plant2",
+      #  outputs={
+       #     bel: solph.Flow(
+        #        nominal_value=10,
+         #       min=0.5,
+          #      max=1.0,
+           #     variable_costs=10,
+            #    nonconvex=solph.NonConvex(startup_costs=5, shutdown_costs=5),
+            #)
+        #},
+    #)
+    #es.add(bel, demand_el, pp1, pp2)
+    # create an optimization problem and solve it
+    om = solph.Model(es)
+
+    # debugging
+    # om.write('problem.lp', io_options={'symbolic_solver_labels': True})
+
+    # solve model
+    om.solve(solver="cbc", solve_kwargs={"tee": True})
+
+    # create result object
+    results = solph.processing.results(om)
+
+    # Erstellt einen DataFrame aus den Ergebnissen für Energieflüsse, die in den Bus gehen.
+    to_bus = pd.DataFrame(
+        {k[0].label: v["sequences"]["flow"] for k, v in results.items() if k[1] == power_bus}
+    )
+    
+    # Erstellt einen DataFrame aus den Ergebnissen für Energieflüsse, die aus dem Bus kommen, und multipliziert sie mit -1, um die Richtung umzukehren.
+    from_bus = pd.DataFrame(
+        {k[1].label: v["sequences"]["flow"] * -1 for k, v in results.items() if k[0] == power_bus}
+    )
+    
+    # Vereinigt die beiden DataFrames 'to_bus' und 'from_bus', um einen gesamten Überblick über die Energieflüsse zu erhalten.
+    data = pd.concat([from_bus, to_bus], axis=1)
+    
+    # Erstellt ein Liniendiagramm mit den Daten in 'data', wobei jeder Schritt nach dem letzten Wert gezeichnet wird.
+    ax = data.plot(kind="line", drawstyle="steps-post", grid=True, rot=0)
+    
+    # Setzt das Label der x-Achse auf "Hour".
+    ax.set_xlabel("Hour")
+    
+    # Setzt das Label der y-Achse auf "P (MW)".
+    ax.set_ylabel("P (MW)")
+    
+    # Zeigt das Diagramm an.
+    plt.show()
+
+    bus_results = solph.views.node(results, "Power_Bus_0")
+    print(bus_results.items())
+
+
+if __name__ == "__main__":
+    main()
+          echo Add other actions to build,
+          echo test, and deploy your project.
