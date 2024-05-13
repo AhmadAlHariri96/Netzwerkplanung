@@ -306,5 +306,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-          echo Add other actions to build,
-          echo test, and deploy your project.
