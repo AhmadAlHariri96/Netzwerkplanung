@@ -61,21 +61,35 @@ def main():
     net_gas = ppipes.create_empty_network(fluid="hydrogen")
 
     # create an energy system
-    idx = solph.create_time_index(2017, number=len(demand_el))
+    # Erstellen eines leeren Energiesystems
+    idx = pd.date_range('2023-01-01', periods=24, freq='H')
     es = solph.EnergySystem(timeindex=idx, infer_last_interval=False)
     #create buses
     bus1 = ppower.create_bus(net_power, vn_kv=0.8, name="Bus 1")
+    bus2 = ppower.create_bus(net_power, vn_kv=0.8, name="Bus 2")
+    bus3 = ppower.create_bus(net_power, vn_kv=0.8, name="Bus 3")
+    bus4 = ppower.create_bus(net_power, vn_kv=0.8, name="Bus 4")
 
     
     load1 = ppower.create_load(net_power, bus=bus1,nominal_value=100, p_mw=0.03, min_p_mw=0, max_p_mw=0.2, min_q_mvar=0, max_q_mvar=0.3, controllable=False,  name="Load 1")
+    load1 = ppower.create_load(net_power, bus=bus2,nominal_value=100, p_mw=0.03, min_p_mw=0, max_p_mw=0.2, min_q_mvar=0, max_q_mvar=0.3, controllable=False,  name="Load 2")
+    load1 = ppower.create_load(net_power, bus=bus2,nominal_value=100, p_mw=0.03, min_p_mw=0, max_p_mw=0.2, min_q_mvar=0, max_q_mvar=0.3, controllable=False,  name="Load 3")
+    load1 = ppower.create_load(net_power, bus=bus4,nominal_value=100, p_mw=0.03, min_p_mw=0, max_p_mw=0.2, min_q_mvar=0, max_q_mvar=0.3, controllable=False,  name="Load 4")
 
-    gen1 = ppower.create_sgen(net_power, bus=bus1,nominal_value=10, variable_costs=10,p_mw=0.5, min_p_mw=0.2, max_p_mw=1, controllable=True,  name="Gen1")
+
+    gen1 = ppower.create_sgen(net_power, bus=bus1,nominal_value=10, startup_costs=500, shutdown_costs=500,variable_costs=50,p_mw=0.5, min_p_mw=0.2, max_p_mw=1, controllable=True,  name="Gen1")
+    gen2 = ppower.create_sgen(net_power, bus=bus2,nominal_value=100,  startup_costs=10, shutdown_costs=500,variable_costs=50,p_mw=0.3, min_p_mw=0.2, max_p_mw=1, controllable=True,  name="Gen2")
+    gen3 = ppower.create_sgen(net_power, bus=bus3,nominal_value=10, startup_costs=500, shutdown_costs=500, variable_costs=50,p_mw=0.5, min_p_mw=0.2, max_p_mw=1, controllable=True,  name="Gen3")
 
     storage1=ppower.create_storage(net_power, bus=bus1, p_mw=0.5, max_e_mwh=.2, soc_percent=0., q_mvar=0., controllable=True,  name="St1")
+    storage2=ppower.create_storage(net_power, bus=bus4, p_mw=0.5, max_e_mwh=.2, soc_percent=0., q_mvar=0., controllable=True,  name="St2")
 
 
     junction1 = ppipes.create_junction(net_gas, pn_bar=1.05, tfluid_k=293.15, name="Junction 1", geodata=(2, 0))
-    
+    junction2 = ppipes.create_junction(net_gas, pn_bar=1.05, tfluid_k=293.15, name="Junction 2", geodata=(2, 0))
+    junction3 = ppipes.create_junction(net_gas, pn_bar=1.05, tfluid_k=293.15, name="Junction 3", geodata=(2, 0))
+    junction4 = ppipes.create_junction(net_gas, pn_bar=1.05, tfluid_k=293.15, name="Junction 4", geodata=(2, 0))
+
     source = ppipes.create_source(net_gas, junction=junction1,nominal_value=10, mdot_kg_per_s=0.001)
 
 
@@ -156,12 +170,13 @@ def main():
             min_p_mw_oemof=pandapower_source.min_p_mw * 1e6
             max_p_mw_oemof=pandapower_source.max_p_mw* 1e6
             nominal_value=pandapower_source.nominal_value
-
+            startup_costs=pandapower_source.startup_costs
+            shutdown_costs=pandapower_source.shutdown_costs
             oemof_source = solph.components.Source(label=source_label,
                                         outputs={oemof_buses[f"Power_Bus_{bus_index}"]: 
                                                  solph.Flow(nominal_value=nominal_value,
                                                             variable_costs=variable_costs,
-                                                            nonconvex=solph.NonConvex(startup_costs=500, shutdown_costs=500),
+                                                            nonconvex=solph.NonConvex(startup_costs=startup_costs, shutdown_costs=shutdown_costs),
                                                             )})
             es.add(oemof_source)
             oemof_sources[source_label] = oemof_source
@@ -235,74 +250,57 @@ def main():
     )
     es.add(oemof_converter)
 
-    
-    # pp1 and pp2 are competing to serve overall 12 units load at lowest cost
-    # summed costs for pp1 = 12 * 10 * 10.25 = 1230
-    # summed costs for pp2 = 4*5 + 4*5 + 12 * 10 * 10 = 1240
-    # => pp1 serves the load despite of higher variable costs since
-    #    the start and shutdown costs of pp2 change its marginal costs
-    #pp1 = solph.components.Source(
-        #label="power_plant1",
-        #outputs={bel: solph.Flow(nominal_value=10, variable_costs=10.25)},
-    #)
 
-    # shutdown costs only work in combination with a minimum load
-    # since otherwise the status variable is "allowed" to be active i.e.
-    # it permanently has a value of one which does not allow to set the shutdown
-    # variable which is set to one if the status variable changes from one to zero
-    #pp2 = solph.components.Source(
-     #   label="power_plant2",
-      #  outputs={
-       #     bel: solph.Flow(
-        #        nominal_value=10,
-         #       min=0.5,
-          #      max=1.0,
-           #     variable_costs=10,
-            #    nonconvex=solph.NonConvex(startup_costs=5, shutdown_costs=5),
-            #)
-        #},
-    #)
-    #es.add(bel, demand_el, pp1, pp2)
     # create an optimization problem and solve it
     om = solph.Model(es)
-
+    
     # debugging
     # om.write('problem.lp', io_options={'symbolic_solver_labels': True})
-
+    
     # solve model
     om.solve(solver="cbc", solve_kwargs={"tee": True})
-
+    
     # create result object
     results = solph.processing.results(om)
 
-    # Erstellt einen DataFrame aus den Ergebnissen für Energieflüsse, die in den Bus gehen.
-    to_bus = pd.DataFrame(
-        {k[0].label: v["sequences"]["flow"] for k, v in results.items() if k[1] == power_bus}
-    )
+    # Energieflüsse extrahieren
+    flow_dataframes = []
+    for (component, attr), values in results.items():
+        if 'sequences' in values:
+            df = values['sequences']
+            df.columns = [f"{component.label}_{attr}_{col}" for col in df.columns]
+            flow_dataframes.append(df)
     
-    # Erstellt einen DataFrame aus den Ergebnissen für Energieflüsse, die aus dem Bus kommen, und multipliziert sie mit -1, um die Richtung umzukehren.
-    from_bus = pd.DataFrame(
-        {k[1].label: v["sequences"]["flow"] * -1 for k, v in results.items() if k[0] == power_bus}
-    )
+    # Speicherebenen extrahieren
+    storage_dataframes = []
+    for component in es.groups:
+        if isinstance(component, solph.components.GenericStorage):
+            df = solph.views.node(results, component.label)['sequences']
+            df.columns = [f"{component.label}_storage_content"]
+            storage_dataframes.append(df)
     
-    # Vereinigt die beiden DataFrames 'to_bus' und 'from_bus', um einen gesamten Überblick über die Energieflüsse zu erhalten.
-    data = pd.concat([from_bus, to_bus], axis=1)
+    # Zusammenführen aller DataFrames zu einem einzigen DataFrame
+    all_dataframes = flow_dataframes + storage_dataframes
+    result_df = pd.concat(all_dataframes, axis=1)
     
-    # Erstellt ein Liniendiagramm mit den Daten in 'data', wobei jeder Schritt nach dem letzten Wert gezeichnet wird.
-    ax = data.plot(kind="line", drawstyle="steps-post", grid=True, rot=0)
+    # Speichern der Ergebnisse in eine Excel-Datei
+    result_df.to_excel("optimization_results.xlsx", index=True)
     
-    # Setzt das Label der x-Achse auf "Hour".
-    ax.set_xlabel("Hour")
+    print("Ergebnisse wurden in 'optimization_results.xlsx' gespeichert.")
     
-    # Setzt das Label der y-Achse auf "P (MW)".
-    ax.set_ylabel("P (MW)")
+    # Plotten der Energieflüsse
+    for df in flow_dataframes:
+        df.plot(title="Energy Flows")
+        plt.xlabel("Time")
+        plt.ylabel("Flow")
+        plt.show()
     
-    # Zeigt das Diagramm an.
-    plt.show()
-
-    bus_results = solph.views.node(results, "Power_Bus_0")
-    print(bus_results.items())
-
-
+    # Plotten der Speicherebenen
+    for df in storage_dataframes:
+        df.plot(title="Storage Levels")
+        plt.xlabel("Time")
+        plt.ylabel("Storage Content")
+        plt.show()
+        
 if __name__ == "__main__":
     main()
